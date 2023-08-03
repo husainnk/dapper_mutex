@@ -585,7 +585,7 @@ public:
     AU.addRequired<ScalarEvolution>();
   }
 
-  virtual const char *getPassName() const
+  virtual StringRef getPassName() const
   { return "Select migration point locations"; }
 
   static inline unsigned splitFuncValPair(const std::string &Pair,
@@ -635,12 +635,23 @@ public:
   /// Select where to insert migration points into functions.
   virtual bool runOnFunction(Function &F)
   {
-    DEBUG(dbgs() << "\n********** SELECT MIGRATION POINTS **********\n"
+    LLVM_DEBUG(dbgs() << "\n********** SELECT MIGRATION POINTS **********\n"
                  << "********** Function: " << F.getName() << "\n\n");
 
-    if(F.hasFnAttribute("popcorn-noinstr") ||
-       NoInstFuncs.find(F.getName()) != NoInstFuncs.end()) return false;
+    if(F.hasFnAttribute("popcorn_noinstr") ||
+       NoInstFuncs.find(F.getName()) != NoInstFuncs.end()){
+    LLVM_DEBUG(dbgs() << "\n********** SKIP MIGRATION POINTS **********\n"
+                 << "********** Function: " << F.getName() << "\n\n");
 
+	    return false;
+    }
+
+    if(F.getName().equals("handler"))
+    {
+	    LLVM_DEBUG(dbgs() << "\n********** SKIP MIGRATION POINTS **********\n"
+			    << "********** Function: " << F.getName() << "\n\n");
+	    return false;
+    }
     initializeAnalysis(F);
 
     // Some operations (e.g., big memory copies, I/O) will cause aborts.
@@ -693,16 +704,16 @@ public:
       if(!analyzeFunctionBody(F)) {
         for(Function::iterator BB = F.begin(), E = F.end(); BB != E; BB++)
           if(isa<ReturnInst>(BB->getTerminator()) &&
-             !BBWeights[BB].BlockWeight->underPercentOfThreshold(CurStartThresh))
+             !BBWeights[&*BB].BlockWeight->underPercentOfThreshold(CurStartThresh))
             MarkStart = true;
       }
       else MarkStart = true;
 
       if(MarkStart) {
-        DEBUG(dbgs() << "-> Marking function entry as a migration point <-\n");
-        markAsMigPoint(F.getEntryBlock().getFirstInsertionPt(), true, true);
+        LLVM_DEBUG(dbgs() << "-> Marking function entry as a migration point <-\n");
+        markAsMigPoint(&*F.getEntryBlock().getFirstInsertionPt(), true, true);
       }
-      else { DEBUG(dbgs() << "-> Eliding instrumenting function entry <-\n"); }
+      else { LLVM_DEBUG(dbgs() << "-> Eliding instrumenting function entry <-\n"); }
     }
     else {
       if(MoreMigPoints) {
@@ -713,14 +724,37 @@ public:
         F.getContext().diagnose(DI);
       }
 
-      DEBUG(dbgs() << "-> Marking function entry as a migration point <-\n");
-      markAsMigPoint(F.getEntryBlock().getFirstInsertionPt(), true, true);
+      LLVM_DEBUG(dbgs() << "-> Marking function entry as a migration point <-\n");
+      markAsMigPoint(&*F.getEntryBlock().getFirstInsertionPt(), true, true);
 
       // Instrument function exit point(s)
-      DEBUG(dbgs() << "-> Marking function exit(s) as a migration point <-\n");
+      LLVM_DEBUG(dbgs() << "-> Marking function exit(s) as a migration point <-\n");
       for(Function::iterator BB = F.begin(), E = F.end(); BB != E; BB++)
+      {
         if(isa<ReturnInst>(BB->getTerminator()))
-          markAsMigPoint(BB->getTerminator(), true, true);
+        	markAsMigPoint(BB->getTerminator(), true, true);
+
+	for (BasicBlock::iterator I = BB->begin(), IE = BB->end(); I != IE; ++I) {
+
+		if(isa<CallInst>(I) || isa<InvokeInst>(I)) {
+//			LLVM_DEBUG(dbgs() << "-> CALL_INS\n");
+			CallInst   *CI = dyn_cast<CallInst>(I);
+			Function *fun = CI->getCalledFunction();
+			if (!fun)
+				continue;
+
+			LLVM_DEBUG(dbgs() << "-> "<<fun->getName() << "\n");
+			StringRef func_name = fun->getName();
+			if(func_name.equals("pthread_mutex_lock") || func_name.equals("pthread_mutex_unlock"))
+			{
+				LLVM_DEBUG(dbgs() << "Add Mask Migration:  \n"<< func_name);
+				markAsMigPoint(&*I, true, true);
+			}
+
+		}
+	}
+      }
+
     }
 
     // Finally, apply transformations to loops headers according to analysis.

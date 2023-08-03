@@ -59,8 +59,26 @@ public:
   MigrationPoints() : FunctionPass(ID) {}
   ~MigrationPoints() {}
 
-  virtual const char *getPassName() const
+  virtual StringRef getPassName() const
   { return "Insert migration points"; }
+
+
+
+  /// Generate the migration library API function declaration.
+  FunctionCallee addMaskMigrationIntrinsic(Module &M, StringRef funcName) {
+    LLVMContext &C = M.getContext();
+    Type *VoidTy = Type::getVoidTy(C);
+    PointerType *VoidPtrTy = Type::getInt8PtrTy(C, 0);
+    std::vector<Type *> FuncPtrArgTy = { VoidPtrTy };
+    FunctionType *FuncPtrTy = FunctionType::get(VoidTy, FuncPtrArgTy, false);
+    CallbackType = PointerType::get(FuncPtrTy, 0);
+    std::vector<Type *> ArgTy = { CallbackType, VoidPtrTy };
+    FunctionType *FuncTy = FunctionType::get(VoidTy, ArgTy, false);
+
+    LLVM_DEBUG(dbgs() << "DAPPER  - set_migrate_mask\n"); 
+    return  M.getOrInsertFunction(funcName, FuncTy);
+  }
+
 
   /// Generate the migration library API function declaration.
   void addMigrationIntrinsic(Module &M, bool DoHTM) {
@@ -113,7 +131,10 @@ public:
       }
       break;
     case Popcorn::Cycles:
+      LLVM_DEBUG(dbgs() << "[DAPPER] Add Migration Intrincs\n"); 
       addMigrationIntrinsic(M, false);
+      SetMaskMigrateAPI = addMaskMigrationIntrinsic(M, "set_migrate_mask");
+      ClrMaskMigrateAPI = addMaskMigrationIntrinsic(M, "clr_migrate_mask");
       break;
     case Popcorn::None:
       return false;
@@ -173,6 +194,7 @@ public:
     DoHTMInst = false;
     DoAbortInstrument = false;
     MigPointInsts.clear();
+    MaskMigrationPoints.clear();
     HTMBeginInsts.clear();
     HTMEndInsts.clear();
 
@@ -244,7 +266,8 @@ private:
   std::ofstream MapFile;
 
   /// Function declaration & migration node ID for migration library API
-  Constant *MigrateAPI;
+  FunctionCallee MigrateAPI;
+  FunctionCallee SetMaskMigrateAPI,ClrMaskMigrateAPI;
   GlobalValue *MigrateFlag;
   PointerType *CallbackType;
 
@@ -261,6 +284,7 @@ private:
   const static IntrinsicMap HTMTest;
 
   /// Code locations marked for instrumentation.
+  SmallPtrSet<Instruction *, 32> MaskMigrationPoints;;
   SmallPtrSet<Instruction *, 32> MigPointInsts;
   SmallPtrSet<Instruction *, 32> HTMBeginInsts;
   SmallPtrSet<Instruction *, 32> HTMEndInsts;
@@ -274,11 +298,47 @@ private:
   void findInstrumentationPoints(Function &F) {
     for(Function::iterator BB = F.begin(), BBE = F.end(); BB != BBE; BB++) {
       for(BasicBlock::iterator I = BB->begin(), IE = BB->end(); I != IE; I++) {
-        if(Popcorn::hasEquivalencePointMetadata(I)) MigPointInsts.insert(I);
-        if(Popcorn::isHTMBeginPoint(I)) HTMBeginInsts.insert(I);
-        if(Popcorn::isHTMEndPoint(I)) HTMEndInsts.insert(I);
+        if(Popcorn::hasEquivalencePointMetadata(&*I)){
+
+	   LLVM_DEBUG(dbgs() << "DAPPER insert\n"); 
+	       	MigPointInsts.insert(&*I);
+	
+
+
+	}
+        if(Popcorn::isHTMBeginPoint(&*I)) HTMBeginInsts.insert(&*I);
+        if(Popcorn::isHTMEndPoint(&*I)) HTMEndInsts.insert(&*I);
+
+	if(isa<CallInst>(I) || isa<InvokeInst>(I)) {
+		CallInst   *CI = dyn_cast<CallInst>(I);
+		Function *fun = CI->getCalledFunction();
+		if (!fun) 
+			continue;
+
+		LLVM_DEBUG(dbgs() << "-> "<<fun->getName() << "\n");
+		StringRef func_name = fun->getName();
+		if(func_name.equals("pthread_mutex_lock") ||  func_name.equals("pthread_mutex_unlock") )
+		{
+			LLVM_DEBUG(dbgs() << "add to list \n");
+			MaskMigrationPoints.insert(&*I );
+		}
+
+	}
       }
     }
+  }
+
+
+
+  /// Add a migration point directly before an instruction.
+  void addMaskMigrationPoint(Instruction *I,FunctionCallee api) {
+    LLVMContext &C = I->getContext();
+    IRBuilder<> Worker(I);
+    std::vector<Value *> Args = {
+      ConstantPointerNull::get(CallbackType),
+      ConstantPointerNull::get(Type::getInt8PtrTy(C, 0))
+    };
+    Worker.CreateCall(api, Args);
   }
 
   /// Add a migration point directly before an instruction.
@@ -456,6 +516,19 @@ private:
           I != E; ++I) {
         addMigrationPoint(*I);
         NumMigPoints++;
+      }
+      for(auto I = MaskMigrationPoints.begin(), E = MaskMigrationPoints.end();
+		      I != E; ++I) {
+
+	       Instruction *ins = *I;
+		CallInst *CI = dyn_cast<CallInst>(ins);
+		Function *fun = CI->getCalledFunction();
+		StringRef func_name = fun->getName();
+		if(func_name.equals("pthread_mutex_lock"))
+	         addMaskMigrationPoint(*I,SetMaskMigrateAPI);
+		else		
+	         addMaskMigrationPoint(*I,ClrMaskMigrateAPI);
+
       }
     }
   }
